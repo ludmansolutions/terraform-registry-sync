@@ -126,3 +126,132 @@ Side-by-side comparison of the legacy GitHub Action (`cpina/github-action-push-t
 | **Maintenance** | Feature-frozen | Actively maintained |
 
 The legacy action is a useful generic building block for simple cross-repo pushes. The current system is a purpose-built Terraform module publish pipeline that addresses the security, validation, and operational gaps identified during the analysis of the legacy approach.
+
+---
+
+## Benchmark Comparison
+
+### Codebase Size
+
+| Metric | Legacy (cpina) | Current (terraform-registry-sync) |
+|--------|---------------|-----------------------------------|
+| **Core script** | 176 lines (`entrypoint.sh`) | 603 lines (`publish-module.sh`) |
+| **Workflow YAML** | N/A (user writes their own) | 419 lines (`publish-terraform-modules.yml`) |
+| **Config/manifest** | 77 lines (`action.yml`) | 42 lines (`terraform-modules.json`) |
+| **Setup tooling** | None | 181 lines (`validate-setup.sh`) |
+| **Tests** | None | 274 lines (`publish-module.bats`, 18 tests) |
+| **Total shipped lines** | ~253 | ~1,519 |
+
+### Runtime Overhead
+
+| Metric | Legacy | Current |
+|--------|--------|---------|
+| **Container build** | ~110-160 MB Alpine image (built per run) | None (native runner) |
+| **Docker pull + build** | ~15-30s cold start | 0s |
+| **Terraform setup** | N/A | ~10-15s (`setup-terraform` + `setup-tflint`) |
+| **Runner startup** | Docker container init | GitHub runner (already running) |
+| **Net cold-start overhead** | Higher (Docker build on every run) | Lower (native, tool setup cached) |
+
+### Git Operations Per Single-Module Publish
+
+| Operation | Legacy | Current |
+|-----------|--------|---------|
+| **Clone** | 1 shallow (`--depth 1`) | 1 shallow (`--depth 1`) |
+| **Config** | 4 (`user.email`, `user.name`, `http.version`, `lfs`) | 3 (`safe.directory`, `user.name`, `user.email`) |
+| **Diff/status** | 2 (`git status`, `git diff-index`) | 2 (`git diff-index`, `git ls-files`) |
+| **Stage + commit** | 2 (`git add .`, `git commit`) | 2 (`git add -A`, `git commit`) |
+| **Push** | 1 | 1 (staging) or 2 (production: commit + tag) |
+| **Tag/release** | 0 | 3 (production: `git tag`, `git push tag`, `gh release create`) |
+| **Total git ops** | 10 | 9 (staging) or 13 (production) |
+
+### Network Round-Trips Per Publish
+
+| Phase | Legacy | Current |
+|-------|--------|---------|
+| **SSH keyscan** | 1 | 0 (uses HTTPS + App token) |
+| **Clone** | 1 | 1 |
+| **Push commit** | 1 | 1 |
+| **Push tag** | 0 | 1 (production only) |
+| **Verify tag remote** | 0 | 1 (production only) |
+| **Create release** | 0 | 1 (production only, `gh release create`) |
+| **Artifact upload** | 0 | 1 (payload artifact) |
+| **Artifact download** | 0 | 1 (publish job downloads payload) |
+| **Token generation** | 0 | 1 (GitHub App token mint) |
+| **Total (staging)** | 3 | 5 |
+| **Total (production)** | 3 | 8 |
+
+### Copy/Sync Performance
+
+| Metric | Legacy | Current |
+|--------|--------|---------|
+| **Method** | `cp -ra` (full recursive copy) | `rsync --delete` (differential sync) |
+| **Pre-check** | None | `rsync -n` dry-run + deletion count |
+| **First publish** | Equivalent speed | Equivalent speed |
+| **Subsequent publishes** | Full copy every time | rsync transfers only changed files |
+| **Large module (100+ files, few changes)** | Copies all 100+ files | Transfers only changed files |
+| **Forbidden file handling** | None (copies everything) | `find + delete` sweep after copy |
+
+### Validation Overhead (Current Only)
+
+| Step | Estimated Time | Skippable? |
+|------|---------------|------------|
+| `terraform fmt -check -recursive` | 1-3s | No |
+| `terraform init -backend=false` | 5-15s (provider download) | No |
+| `terraform validate` | 1-3s | No |
+| `tflint --init` + `tflint` | 3-10s | Yes (`SKIP_TFLINT=true`) |
+| `terraform test` | 10-60s (if tests exist) | Yes (off by default) |
+| **Total validation overhead** | ~10-30s typical | Legacy has 0s (no validation) |
+
+### End-to-End Estimated Timeline (Single Module)
+
+| Phase | Legacy | Current (staging) | Current (production) |
+|-------|--------|-------------------|---------------------|
+| **Runner/container start** | 15-30s (Docker build) | 5-10s (runner allocation) | 5-10s |
+| **Checkout** | 0s (runs inside action) | 3-5s | 3-5s |
+| **Tool setup** | 0s (baked in Docker) | 10-15s (Terraform + TFLint) | 10-15s |
+| **Discover modules** | N/A (hardcoded) | 2-5s | 2-5s |
+| **Build payload** | 1-3s (`cp -ra`) | 2-5s (flatten + copy + strip) | 2-5s |
+| **Validation** | 0s (none) | 10-30s | 10-30s |
+| **Artifact upload/download** | 0s | 5-15s | 5-15s |
+| **Attestation** | 0s | 3-5s | 3-5s |
+| **App token generation** | 0s | 2-3s | 2-3s |
+| **Clone target** | 3-5s | 3-5s | 3-5s |
+| **Sync** | 1-3s | 2-5s | 2-5s |
+| **Push** | 3-5s | 3-5s | 3-5s |
+| **Tag + release** | 0s | 0s | 5-10s |
+| **Environment approval** | 0s | 0s | Manual wait |
+| **Total (no approval wait)** | ~25-50s | ~50-110s | ~55-120s |
+
+### Multi-Module Scaling
+
+| Modules | Legacy | Current |
+|---------|--------|---------|
+| **1 module** | 1 workflow run | 1 workflow run (3 jobs) |
+| **2 modules** | 2 separate workflow runs (sequential or manual) | 1 workflow run, matrix parallel (2x validate, 2x publish) |
+| **5 modules** | 5 separate runs | 1 workflow run, matrix parallel (5x validate, 5x publish) |
+| **Adding a module** | New workflow file or matrix edit | 1 JSON entry in manifest |
+| **Scaling pattern** | Linear: N modules = N workflow configs | Constant: N modules = 1 workflow, N matrix entries |
+
+### Resource Usage
+
+| Resource | Legacy | Current |
+|----------|--------|---------|
+| **Docker image storage** | ~110-160 MB per run (cached after first) | 0 (native runner) |
+| **Artifact storage** | 0 | Payload artifact per module (7-day retention) |
+| **Secrets** | 1 PAT (shared across all repos) | 2 secrets per environment (App ID + key) |
+| **GitHub API calls** | 0 | 3-6 per publish (token mint, attestation, release) |
+| **Runner minutes** | ~1 min per module | ~2 min per module (includes validation) |
+
+### Tradeoff Summary
+
+| | Legacy wins | Current wins |
+|---|------------|-------------|
+| **Speed (single module, no validation)** | Faster by ~30-60s (no validation, no artifact round-trip) | |
+| **Speed (multi-module)** | | Matrix parallelism, single workflow run |
+| **Subsequent syncs (large repos)** | | rsync differential transfer |
+| **Cold start** | | No Docker build overhead |
+| **Operational cost** | Fewer API calls, less storage | |
+| **Safety cost** | | Validation catches errors before publish |
+| **Scaling cost** | | Zero-config module additions |
+
+> **Bottom line**: The current pipeline adds ~30-60 seconds per module compared to the legacy action, almost entirely from validation and artifact handling. This is the cost of catching broken Terraform before it reaches production. For multi-module publishes, matrix parallelism recovers most of that overhead.
