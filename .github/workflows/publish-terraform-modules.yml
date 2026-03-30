@@ -1,0 +1,418 @@
+# publish-terraform-modules.yml
+#
+# Manifest-driven Terraform module publish pipeline.
+#
+# Triggers:
+#   - pull_request:   validate only (no publish)
+#   - push to main:   publish changed modules to staging
+#   - version tag:    publish specific module to production
+#   - workflow_dispatch: manual override with module/channel/ref/version/dry_run
+#
+# Architecture:
+#   discover → validate_and_package → publish
+#
+# See: LLM_HANDOFF_TERRAFORM_REGISTRY_PLAN.md
+
+name: Publish Terraform Modules
+
+on:
+  pull_request:
+    paths:
+      - 'deploy/terraform/**'
+      - '.github/terraform-modules.json'
+      - 'scripts/terraform/**'
+
+  push:
+    branches: [main]
+    tags:
+      - 'terraform-*-v*'
+
+  workflow_dispatch:
+    inputs:
+      module:
+        description: 'Module name (from terraform-modules.json)'
+        required: true
+        type: string
+      channel:
+        description: 'Publish channel'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      source_ref:
+        description: 'Source ref to publish from (default: triggering ref)'
+        required: false
+        type: string
+      version:
+        description: 'Version for production release (e.g., 1.2.3)'
+        required: false
+        type: string
+      dry_run:
+        description: 'Dry run (skip push/release)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# ---------------------------------------------------------------------------
+# Discover job
+# ---------------------------------------------------------------------------
+# Reads the manifest, resolves which modules to process, determines the
+# channel (staging/production), and sets outputs for downstream jobs.
+# ---------------------------------------------------------------------------
+jobs:
+  discover:
+    name: Discover modules
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      channel: ${{ steps.resolve.outputs.channel }}
+      is_pr: ${{ steps.resolve.outputs.is_pr }}
+      source_ref: ${{ steps.resolve.outputs.source_ref }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve modules and channel
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          MANIFEST=".github/terraform-modules.json"
+
+          if [[ ! -f "$MANIFEST" ]]; then
+            echo "::error::Manifest not found: $MANIFEST"
+            exit 1
+          fi
+
+          EVENT="${{ github.event_name }}"
+          REF="${{ github.ref }}"
+          INPUT_MODULE="${{ inputs.module }}"
+          INPUT_CHANNEL="${{ inputs.channel }}"
+          INPUT_SOURCE_REF="${{ inputs.source_ref }}"
+          INPUT_VERSION="${{ inputs.version }}"
+
+          # --- Determine channel ---
+          CHANNEL="staging"
+          IS_PR="false"
+
+          if [[ "$EVENT" == "pull_request" ]]; then
+            CHANNEL="validate-only"
+            IS_PR="true"
+          elif [[ "$EVENT" == "push" ]] && [[ "$REF" == refs/tags/terraform-*-v* ]]; then
+            CHANNEL="production"
+          elif [[ "$EVENT" == "workflow_dispatch" ]]; then
+            CHANNEL="$INPUT_CHANNEL"
+          fi
+
+          # --- Determine source ref ---
+          # Always resolve to a commit SHA for the audit trail
+          if [[ -n "$INPUT_SOURCE_REF" ]]; then
+            SOURCE_REF=$(git rev-parse "$INPUT_SOURCE_REF")
+          else
+            SOURCE_REF="${{ github.sha }}"
+          fi
+
+          # --- Resolve modules ---
+          MODULES="[]"
+
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            # Manual: use the specified module
+            MODULES=$(jq -c --arg name "$INPUT_MODULE" \
+              '[.modules[] | select(.name == $name)]' "$MANIFEST")
+            if [[ "$(echo "$MODULES" | jq length)" -eq 0 ]]; then
+              echo "::error::Module '$INPUT_MODULE' not found in manifest"
+              exit 1
+            fi
+            # Inject version from input
+            if [[ -n "$INPUT_VERSION" ]]; then
+              MODULES=$(echo "$MODULES" | jq -c \
+                --arg v "$INPUT_VERSION" \
+                '[.[] | . + {version: $v}]')
+            fi
+
+          elif [[ "$CHANNEL" == "production" ]]; then
+            # Tag push: extract module name from tag
+            TAG="${REF#refs/tags/}"
+            # Match against tag_prefix in manifest
+            MODULES=$(jq -c --arg tag "$TAG" '
+              [.modules[] | select($tag | startswith(.tag_prefix)) |
+                . + {version: ($tag | ltrimstr(.tag_prefix))}]
+            ' "$MANIFEST")
+            if [[ "$(echo "$MODULES" | jq length)" -eq 0 ]]; then
+              echo "::error::No module found matching tag: $TAG"
+              exit 1
+            fi
+
+          else
+            # Push to main or PR: discover changed modules
+            CHANGED_FILES=""
+            if [[ "$EVENT" == "pull_request" ]]; then
+              CHANGED_FILES=$(git diff --name-only \
+                "${{ github.event.pull_request.base.sha }}" \
+                "${{ github.event.pull_request.head.sha }}" 2>/dev/null || echo "")
+            else
+              # Use github.event.before — the commit SHA before this push.
+              # Handles merge commits, multi-commit pushes, and non-linear history.
+              BEFORE_SHA="${{ github.event.before }}"
+              if [[ "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ]] || [[ -z "$BEFORE_SHA" ]]; then
+                # Initial push (new branch) — treat all modules as changed
+                echo "[discover] Initial push detected — all modules will be processed"
+                CHANGED_FILES=$(find deploy/terraform -type f -name '*.tf' 2>/dev/null | head -500 || echo "")
+              else
+                CHANGED_FILES=$(git diff --name-only "$BEFORE_SHA" "${{ github.sha }}" 2>/dev/null || echo "")
+              fi
+            fi
+
+            if [[ -n "$CHANGED_FILES" ]]; then
+              MODULES=$(jq -c --arg files "$CHANGED_FILES" '
+                [.modules[] | select(
+                  ($files | split("\n")) as $fl |
+                  any($fl[]; startswith(.source_path + "/"))
+                )]
+              ' "$MANIFEST")
+            fi
+          fi
+
+          # Handle empty module list
+          if [[ "$(echo "$MODULES" | jq length)" -eq 0 ]]; then
+            echo "::notice::No modules to process"
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+          else
+            # Build matrix
+            MATRIX=$(echo "$MODULES" | jq -c '{include: .}')
+            echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "is_pr=$IS_PR" >> "$GITHUB_OUTPUT"
+          echo "source_ref=$SOURCE_REF" >> "$GITHUB_OUTPUT"
+
+          echo "::group::Resolved configuration"
+          echo "Channel: $CHANNEL"
+          echo "Source ref: $SOURCE_REF"
+          echo "Modules: $(echo "$MODULES" | jq .)"
+          echo "::endgroup::"
+
+  # ---------------------------------------------------------------------------
+  # Validate and Package job
+  # ---------------------------------------------------------------------------
+  # For each discovered module, builds a curated payload, runs the Terraform
+  # validation suite, and uploads the payload as a workflow artifact.
+  # ---------------------------------------------------------------------------
+  validate_and_package:
+    name: Validate & package (${{ matrix.name }})
+    needs: discover
+    if: ${{ needs.discover.outputs.matrix != '{"include":[]}' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.discover.outputs.source_ref }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@5e8dbf3c6d9deaf4193ca7a8fb23f2ac83bb6c85 # v4.0.0
+        with:
+          terraform_wrapper: false
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@90f302c255ef959cbfb4bd10581afecdb7ece3e6 # v4.1.1
+
+      - name: Build payload
+        shell: bash
+        env:
+          SOURCE_PATH: ${{ matrix.source_path }}
+          PAYLOAD_DIR: ${{ runner.temp }}/payload-${{ matrix.name }}
+          FLATTEN_DIRS: ${{ toJson(matrix.flatten_dirs) }}
+          COPY_DIRS: ${{ toJson(matrix.copy_dirs) }}
+          COPY_FILES: ${{ toJson(matrix.copy_files) }}
+          STRIP_PATTERNS: ${{ toJson(matrix.strip_patterns) }}
+          MIN_EXPECTED_FILES: ${{ matrix.min_expected_files || '0' }}
+        run: |
+          scripts/terraform/publish-module.sh build-payload
+
+      - name: Validate payload
+        shell: bash
+        env:
+          PAYLOAD_DIR: ${{ runner.temp }}/payload-${{ matrix.name }}
+        run: |
+          scripts/terraform/publish-module.sh validate
+
+      - name: Upload payload artifact
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: payload-${{ matrix.name }}
+          path: ${{ runner.temp }}/payload-${{ matrix.name }}/
+          retention-days: 7
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Attest payload artifact
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: payload-${{ matrix.name }}
+          subject-digest: sha256:${{ steps.upload.outputs.artifact-digest }}
+
+  # ---------------------------------------------------------------------------
+  # Publish job — Staging
+  # ---------------------------------------------------------------------------
+  # Publishes validated payloads to staging repos. No release created.
+  # ---------------------------------------------------------------------------
+  publish_staging:
+    name: Publish staging (${{ matrix.name }})
+    needs: [discover, validate_and_package]
+    if: ${{ needs.discover.outputs.channel == 'staging' }}
+    runs-on: ubuntu-24.04
+    environment:
+      name: terraform-registry-staging
+    concurrency:
+      group: terraform-publish-staging-${{ matrix.name }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Preflight checks
+        shell: bash
+        run: |
+          errors=0
+          if [[ -z "${{ vars.TERRAFORM_SYNC_APP_ID }}" ]]; then
+            echo "::error::Repository variable TERRAFORM_SYNC_APP_ID is not set. Go to Settings > Variables and secrets > Actions > Variables and add it."
+            errors=1
+          fi
+          if [[ -z "${{ secrets.TERRAFORM_SYNC_APP_PRIVATE_KEY }}" ]]; then
+            echo "::error::Environment secret TERRAFORM_SYNC_APP_PRIVATE_KEY is not set. Go to Settings > Environments > terraform-registry-staging > Environment secrets and add it."
+            errors=1
+          fi
+          if [[ "$errors" -ne 0 ]]; then exit 1; fi
+
+      - name: Checkout scripts
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          sparse-checkout: scripts/terraform
+          sparse-checkout-cone-mode: false
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ vars.TERRAFORM_SYNC_APP_ID }}
+          private-key: ${{ secrets.TERRAFORM_SYNC_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ matrix.staging_repo }}
+          permission-contents: write
+
+      - name: Download payload artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: payload-${{ matrix.name }}
+          path: ${{ runner.temp }}/payload-${{ matrix.name }}
+
+      - name: Publish to staging
+        shell: bash
+        env:
+          PAYLOAD_DIR: ${{ runner.temp }}/payload-${{ matrix.name }}
+          TARGET_REPO: ${{ github.repository_owner }}/${{ matrix.staging_repo }}
+          GIT_TOKEN: ${{ steps.app-token.outputs.token }}
+          CHANNEL: staging
+          MODULE_NAME: ${{ matrix.name }}
+          SOURCE_SHA: ${{ needs.discover.outputs.source_ref }}
+          SOURCE_REPO: ${{ github.repository }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DRY_RUN: "false"
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          scripts/terraform/publish-module.sh publish
+
+  # ---------------------------------------------------------------------------
+  # Publish job — Production
+  # ---------------------------------------------------------------------------
+  # Publishes validated payloads to production repos. Creates tag and release.
+  # Requires environment approval.
+  # ---------------------------------------------------------------------------
+  publish_production:
+    name: Publish production (${{ matrix.name }})
+    needs: [discover, validate_and_package]
+    if: ${{ needs.discover.outputs.channel == 'production' }}
+    runs-on: ubuntu-24.04
+    environment:
+      name: terraform-registry-production
+    concurrency:
+      group: terraform-publish-production-${{ matrix.name }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    steps:
+      - name: Preflight checks
+        shell: bash
+        run: |
+          errors=0
+          if [[ -z "${{ matrix.version }}" ]]; then
+            echo "::error::Production publish requires a version. Use a version tag (e.g., terraform-gcp-v1.2.3) or set version in workflow_dispatch."
+            errors=1
+          fi
+          if [[ -z "${{ vars.TERRAFORM_SYNC_APP_ID }}" ]]; then
+            echo "::error::Repository variable TERRAFORM_SYNC_APP_ID is not set. Go to Settings > Variables and secrets > Actions > Variables and add it."
+            errors=1
+          fi
+          if [[ -z "${{ secrets.TERRAFORM_SYNC_APP_PRIVATE_KEY }}" ]]; then
+            echo "::error::Environment secret TERRAFORM_SYNC_APP_PRIVATE_KEY is not set. Go to Settings > Environments > terraform-registry-production > Environment secrets and add it."
+            errors=1
+          fi
+          if [[ "$errors" -ne 0 ]]; then exit 1; fi
+
+      - name: Checkout scripts
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          sparse-checkout: scripts/terraform
+          sparse-checkout-cone-mode: false
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ vars.TERRAFORM_SYNC_APP_ID }}
+          private-key: ${{ secrets.TERRAFORM_SYNC_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ matrix.production_repo }}
+          permission-contents: write
+
+      - name: Download payload artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: payload-${{ matrix.name }}
+          path: ${{ runner.temp }}/payload-${{ matrix.name }}
+
+      - name: Publish to production
+        shell: bash
+        env:
+          PAYLOAD_DIR: ${{ runner.temp }}/payload-${{ matrix.name }}
+          TARGET_REPO: ${{ github.repository_owner }}/${{ matrix.production_repo }}
+          GIT_TOKEN: ${{ steps.app-token.outputs.token }}
+          CHANNEL: production
+          MODULE_NAME: ${{ matrix.name }}
+          SOURCE_SHA: ${{ needs.discover.outputs.source_ref }}
+          SOURCE_REPO: ${{ github.repository }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          VERSION: ${{ matrix.version }}
+          TAG_PREFIX: ${{ matrix.tag_prefix }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          scripts/terraform/publish-module.sh publish

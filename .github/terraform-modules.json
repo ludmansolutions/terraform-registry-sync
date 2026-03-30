@@ -1,0 +1,42 @@
+{
+  "modules": [
+    {
+      "name": "gcp",
+      "source_path": "deploy/terraform/gcp",
+      "staging_repo": "terraform-gcp-modules-staging",
+      "production_repo": "terraform-gcp-modules",
+      "tag_prefix": "terraform-gcp-v",
+      "flatten_dirs": ["infra"],
+      "copy_dirs": ["bootstrap", "tests", "policies", "modules", "examples"],
+      "copy_files": ["README.md", ".tflint.hcl", "LICENSE", "CHANGELOG.md"],
+      "strip_patterns": [
+        "*.tfstate",
+        "*.tfstate.*",
+        "*.tfvars",
+        "*.tfvars.json",
+        ".terraform/",
+        ".terraform.lock.hcl"
+      ],
+      "min_expected_files": 3
+    },
+    {
+      "name": "aws",
+      "source_path": "deploy/terraform/aws",
+      "staging_repo": "terraform-aws-modules-staging",
+      "production_repo": "terraform-aws-modules",
+      "tag_prefix": "terraform-aws-v",
+      "flatten_dirs": ["infra"],
+      "copy_dirs": ["bootstrap", "tests", "policies", "modules", "examples"],
+      "copy_files": ["README.md", ".tflint.hcl", "LICENSE", "CHANGELOG.md"],
+      "strip_patterns": [
+        "*.tfstate",
+        "*.tfstate.*",
+        "*.tfvars",
+        "*.tfvars.json",
+        ".terraform/",
+        ".terraform.lock.hcl"
+      ],
+      "min_expected_files": 3
+    }
+  ]
+}
